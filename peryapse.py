@@ -2,7 +2,7 @@
 """
 Purpose:
 
-  Find spacecraft periapsis/-es in a SPICE SP-Kernel (SPK)
+  Find spacecraft periapsides in a SPICE SP-Kernel (SPK)
 
 Usage:
 
@@ -32,7 +32,7 @@ Example:
         - Sun-centered segments are ignored by default
       - One segment has Hartley 2 as the center
       - One segment has Earth as the center
-    - The Hartley 2- and Earth-centered segments are searched for periapses
+    - The Hartley 2- and Earth-centered segments are searched for periapsides
 
     - The results are below, with ***comment lines*** and blank lines
       inserted here for clarity
@@ -257,7 +257,7 @@ def do_main(lt_argv):
                               if reffrm!=spk_reffrm_name
                               ]:
 
-        ### Find any periapses
+        ### Find any periapsides
         result = sp.cell_double(1000)
         sp.gfposc(target_name,eval_reffrm,"NONE",center_name
                  ,"RA/DEC", "RANGE","LOCMIN"
@@ -265,7 +265,7 @@ def do_main(lt_argv):
                  ,2000,cnfine,result
                  )
 
-        ### Loop over periapses
+        ### Loop over periapsides
         count = sp.wncard(result)
         for i in range(count):
           no_periapsis_found = False
@@ -303,7 +303,7 @@ def do_main(lt_argv):
 
       if no_periapsis_found:
         ### Flag cases where no local range minima were in the segment
-        print(dict(Result='No periapses found in this time range'))
+        print(dict(Result='No periapsides found in this time range'))
 
     ### UNLOAD the SPK
     sp.spkuef(handle)
