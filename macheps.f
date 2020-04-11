@@ -1,3 +1,13 @@
+CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
+C
+C Purpose:  approximate [machine+Fortran compiler] epsilon
+C
+C Build:  gfortran -static macheps.f -o macheps64lebeau
+C Build:  g77 -static macheps.f -o macheps32hogan (hogan)
+C
+C Run:  ./macheps32hogan
+C
+CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
       program macheps
       implicitnone
       doubleprecision dble_epsi
