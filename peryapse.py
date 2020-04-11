@@ -100,11 +100,28 @@ N.B. Positions and velocities do include corrections for neither
 """
 import os
 import sys
+import numpy
 import pprint
 import spiceypy as sp
 import traceback as tb
 
 do_debug = 'DEBUG' in os.environ
+
+try: sp_cell_double = sp.cell_double
+except: sp_cell_double = sp.stypes.SPICEDOUBLE_CELL
+
+
+########################################################################
+int64_ets_adjust = numpy.array([1,-1],dtype=numpy.int64)
+def fix_cnfine(ets):
+  """Adjust CNFINE ETs by 1 epsilon inward"""
+  return numpy.frombuffer((numpy.frombuffer(numpy.array(ets).tobytes()
+                                           ,dtype=numpy.int64
+                                           )
+                          +int64_ets_adjust
+                          ).tobytes()
+                          ,dtype=numpy.float64
+                          )
 
 
 ########################################################################
@@ -122,7 +139,7 @@ targets, or, if none were requested, then a spacecraft
   def deny_center_sun(self): self.center_sun_allowed = False
   def allow_center_sun(self): self.center_sun_allowed = True
 
-  def add(self,target_name):
+  def append(self,target_name):
     """Add SPICE body name as integer"""
     target_id = sp.bods2c(target_name)
     self.dt_ids[target_id] = target_name
@@ -150,10 +167,52 @@ return names or False,False
 
 
 ########################################################################
+class CFRAMES(object):
+  """Build, then iterate over, a list of canonical SPICE frame names"""
+  def __init__(self):
+    self.lt_frames = list()
+
+  def append(self,frame_name):
+    """Append new unique valid frame name; throw exception if invalid"""
+    ### Throw SpiceyError exception if this is an unknown frame
+    frame_id = sp.namfrm(frame_name)
+    if 0 == frame_id: raise sp.utils.support_types.SpiceyError
+    ### Add the canonical name to the list, but no duplicates
+    canonical_name = sp.frmnam(frame_id)
+    if canonical_name in self.lt_frames: return
+    self.lt_frames.append(canonical_name)
+
+  def iterator(self,first_frame=None):
+    """Yield frame names in order, but with first_frame first"""
+    if first_frame is None:
+      canonical_first_frame = ''
+    else:
+      canonical_first_frame = sp.frmnam(sp.namfrm(first_frame))
+      assert 0 != sp.namfrm(first_frame)
+      yield first_frame
+
+    for frame in self.lt_frames:
+      ### Do not duplicate first frame
+      if frame == canonical_first_frame: continue
+      yield frame
+
+
+########################################################################
+class SPKS(object):
+  """Maintain information about internals of a list of SPKs"""
+  def __init__(self):
+    self.lt_spks,self.dt_spks = list(),dict()
+
+  def append(self,fn_spk):
+    handle = sp.spklef(fn_spk)
+    sp.spkuef(handle)
+    self.lt_spks.append(fn_spk)
+    self.dt_spks[fn_spk] = list()
+
+########################################################################
 def do_main(lt_argv):
 
-
-  tsoi,lt_reffrms,lt_spks = TARGETS(),list(),list()
+  tsoi,cframes,spks = TARGETS(),CFRAMES(),SPKS()
 
   for arg in lt_argv:
 
@@ -161,48 +220,28 @@ def do_main(lt_argv):
       tsoi.allow_center_sun()
       continue
 
-    ### Try to load this arg as an SPK
-    try:
-      handle = sp.spklef(arg)
-      sp.spkuef(handle)
-      lt_spks.append(arg)
-      continue
-    except sp.utils.support_types.SpiceyError:
-      if do_debug:
-        tb.print_exc()
-        print('\nIgnored spiceypy error\n')
-    except:
-      raise
+    for obj in (spks,cframes,tsoi,None):
+      try:
+        ### Try to append this arg to any object that is not None
+        if not (None is obj): obj.append(arg)
+        break
+      except sp.utils.support_types.SpiceyError: ### Ignore SPICE errors
+        if do_debug:
+          tb.print_exc()
+          print('\nIgnored spiceypy error\n')
+      except:
+        raise
 
-    ### Check if this arg is an integer or name of a known inertial frame
-    try:
-      frmid = sp.namfrm(arg)
-      if frmid != 0:
-        lt_reffrms.append(sp.frmnam(frmid))
-        continue
-    except sp.utils.support_types.SpiceyError:
-      if do_debug:
-        tb.print_exc()
-        print('\nIgnored spiceypy error\n')
-    except:
-      raise
+    ### Loop will exit with obj as None if arg is none of those objects;
+    ### => assume arg is a SPICE kernel e.g. TK with name/ID translation
+    if None is obj: sp.furnsh(arg)
 
-    ### Check if this is a integer or name of a known spacecraft
-    try:
-      tsoi.add(arg)
-      continue
-    except sp.utils.support_types.SpiceyError:
-      if do_debug:
-        tb.print_exc()
-        print('\nIgnored spiceypy error\n')
-    except:
-      raise
 
-    ### anything else is a SPICE kernel e.g. TK with name/ID translation
-    sp.furnsh(arg)
+  ######################################################################
+  base_comments = []
 
   ### Loop over SPKs
-  for spkfn in lt_spks:
+  for spkfn in spks.lt_spks:
 
     ### Load the SPK and start a segment array search
     handle = sp.spklef(spkfn)
@@ -213,8 +252,10 @@ def do_main(lt_argv):
     ### Loop over segments
     while sp.daffna():
 
-      ### Get and parse segment summary
+      ### Get and parse segment summary; adjust ET start and stop limits
       ets,ic = sp.dafus(sp.dafgs(),2,6)
+      ets = fix_cnfine(ets)
+
       (target_id,center_id,spk_reffrm_id,segtype,addrinit,addr_final
       ,)= map(int,ic)
 
@@ -224,11 +265,14 @@ def do_main(lt_argv):
       target_name,center_name = tsoi.of_interest(target_id,center_id)
 
       if target_name:
-        ### Add ETs, names and frame is segment is of interest
+        ### Add ETs, names and frame if segment is of interest
         lt_found.append((ets,target_name,center_name,spk_reffrm_id,segtype,))
+
 
     ### Loop over segments of interest
     for (ets,target_name,center_name,spk_reffrm_id,segtype) in lt_found:
+
+      segment_comments = []
 
       ### Convert frame ID to name
       spk_reffrm_name = sp.frmnam(spk_reffrm_id)
@@ -246,24 +290,33 @@ def do_main(lt_argv):
 
       ### Initialize CNFINE argument to be passed to GFPOSC
       cnfine = sp.cell_double(2)
+
       sp.wninsd(ets[0],ets[1],cnfine)
 
       ### Maintain flag of whether a local minimum of range was found
       no_periapsis_found = True
 
       ### Loop over segment frame, plus any frames provided via argv
-      for eval_reffrm in [spk_reffrm_name
-                         ] + [reffrm for reffrm in lt_reffrms
-                              if reffrm!=spk_reffrm_name
-                              ]:
+      for eval_reffrm in cframes.iterator(spk_reffrm_name):
 
         ### Find any periapsides
         result = sp.cell_double(1000)
-        sp.gfposc(target_name,eval_reffrm,"NONE",center_name
-                 ,"RA/DEC", "RANGE","LOCMIN"
-                 ,0.0,0.0,sp.spd()/4.0
-                 ,2000,cnfine,result
-                 )
+        try:
+          sp.gfposc(target_name,eval_reffrm,"NONE",center_name
+                   ,"RA/DEC", "RANGE","LOCMIN"
+                   ,0.0,0.0,sp.spd()/4.0
+                   ,2000,cnfine,result
+                   )
+        except:
+          etcnfine = sp.wnfetd(cnfine,0)
+          segment_comments.append(tb.format_exc())
+          cnfine = sp.cell_double(2)
+          sp.wninsd(ets[0]+1e-3,ets[1]-1e-3,cnfine)
+          sp.gfposc(target_name,eval_reffrm,"NONE",center_name
+                   ,"RA/DEC", "RANGE","LOCMIN"
+                   ,0.0,0.0,sp.spd()/4.0
+                   ,2000,cnfine,result
+                   )
 
         ### Loop over periapsides
         count = sp.wncard(result)
@@ -299,6 +352,7 @@ def do_main(lt_argv):
                             ,PERPOS=list(perppos)
                             ,PERVEL=list(perpvel)
                             ,POSDIFF=sp.vnorm(sp.vsub(gfpos,perppos))
+                            ,ZZCOMMENTS=base_comments+segment_comments
                             ,))
 
       if no_periapsis_found:
