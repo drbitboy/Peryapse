@@ -320,8 +320,8 @@ class SPKS(object):
     return self
 
   ######################################################################
-  def dumpjson(self,f=sys.stdout):
-    sj.dump(self.dt_spks,f,indent=2,sort_keys=True)
+  def dumpsjson(self,f=sys.stdout):
+    return sj.dumps(self.dt_spks,f,indent=2,sort_keys=True)
 
 
 ########################################################################
@@ -355,9 +355,9 @@ def do_main(lt_argv):
 
 
   ######################################################################
-  spks.process_spks(tsoi,cframes).dumpjson()
+  return spks.process_spks(tsoi,cframes).dumpsjson()
 
 
 ########################################################################
 if "__main__" == __name__ and sys.argv[1:]:
-  do_main(sys.argv[1:])
+  print(do_main(sys.argv[1:]))
