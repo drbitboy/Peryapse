@@ -104,6 +104,8 @@ import numpy
 import pprint
 import spiceypy as sp
 import traceback as tb
+try: import simplejson as sj
+except: import json as sj
 
 do_debug = 'DEBUG' in os.environ
 
@@ -113,8 +115,8 @@ except: sp_cell_double = sp.stypes.SPICEDOUBLE_CELL
 
 ########################################################################
 int64_ets_adjust = numpy.array([1,-1],dtype=numpy.int64)
-def fix_cnfine(ets):
-  """Adjust CNFINE ETs by 1 epsilon inward"""
+def pinch_segment_limits(ets):
+  """Adjust CNFINE ET limits inward by 1 epsilon"""
   return numpy.frombuffer((numpy.frombuffer(numpy.array(ets).tobytes()
                                            ,dtype=numpy.int64
                                            )
@@ -165,7 +167,6 @@ return names or False,False
 
     return False,False
 
-
 ########################################################################
 class CFRAMES(object):
   """Build, then iterate over, a list of canonical SPICE frame names"""
@@ -176,7 +177,7 @@ class CFRAMES(object):
     """Append new unique valid frame name; throw exception if invalid"""
     ### Throw SpiceyError exception if this is an unknown frame
     frame_id = sp.namfrm(frame_name)
-    if 0 == frame_id: raise sp.utils.support_types.SpiceyError
+    if 0 == frame_id: raise sp.utils.support_types.SpiceyError('ignore')
     ### Add the canonical name to the list, but no duplicates
     canonical_name = sp.frmnam(frame_id)
     if canonical_name in self.lt_frames: return
@@ -196,6 +197,8 @@ class CFRAMES(object):
       if frame == canonical_first_frame: continue
       yield frame
 
+empty_tsoi = TARGETS()
+empty_cframes = CFRAMES()
 
 ########################################################################
 class SPKS(object):
@@ -208,12 +211,126 @@ class SPKS(object):
     sp.spkuef(handle)
     self.lt_spks.append(fn_spk)
     self.dt_spks[fn_spk] = list()
+    return self
+
+  def process_spks(self,tsoi=empty_tsoi,cframes=empty_cframes):
+
+    ### Loop over SPKs
+    for spkfn in self.lt_spks:
+
+      ### Load the SPK and start a segment array search
+      handle = sp.spklef(spkfn)
+      sp.dafbfs(handle)
+
+      lt = list()
+
+      ### Loop over segments
+      while sp.daffna():
+
+        ### Get and parse segment summary; adjust ET start & stop limits
+        dc,ic = sp.dafus(sp.dafgs(),2,6)
+        ets = pinch_segment_limits(dc)
+
+        (target_id,center_id,spk_reffrm_id,segtyp,) = map(int,ic[:-2])
+
+        ### Get target name and center names
+        ### - Method tsoi.of_interest will return False,False
+        ###   for segments that should be ignored
+        target_name,center_name = tsoi.of_interest(target_id,center_id)
+
+        if target_name:
+          ### Add ETs, names and frame if segment is of interest
+          lt.append((ets,target_name,center_name,spk_reffrm_id,segtyp,))
+
+      ### Loop over segments of interest
+      for (ets,target_name,center_name,spk_reffrm_id,segtype) in lt:
+
+        ### Convert frame ID to name
+        spk_reffrm_name = sp.frmnam(spk_reffrm_id)
+
+        ### Assemble provenance of segment
+        dt_seg = dict(BODY_CENTER=center_name
+                     ,BODY_TARGET=target_name
+                     ,ETCALS=list(map(sp.etcal,ets))
+                     ,ETS=list(ets)
+                     ,SEGMENT_TYPE=segtyp
+                     ,SEGMENT_FRAME=spk_reffrm_name
+                     ,SPK=spkfn
+                     ,found_periapse=False
+                     )
+        lt_peri = dt_seg['perapsides'] = list()
+
+        ### Initialize CNFINE argument to be passed to GFPOSC
+        cnfine = sp.cell_double(2)
+        sp.wninsd(ets[0],ets[1],cnfine)
+
+        ### Loop over segment frame, plus any frames provided via argv
+        for eval_reffrm in cframes.iterator(spk_reffrm_name):
+
+          ### Find any periapsides
+          result = sp.cell_double(1000)
+          sp.gfposc(target_name,eval_reffrm,"NONE",center_name
+                   ,"RA/DEC", "RANGE","LOCMIN"
+                   ,0.0,0.0,sp.spd()/4.0
+                   ,2000,cnfine,result
+                   )
+
+          ### Loop over periapsides
+          count = sp.wncard(result)
+          for i in range(count):
+
+            dt_seg['found_periapse'] = True
+
+            ### Get state at time of periapse
+            et0 = sp.wnfetd(result,i)[0]
+            (gfstate,lighttime
+            ,) = sp.spkezr(target_name,et0,eval_reffrm,"NONE",center_name)
+            gfpos,gfvel = perppos,perpvel = gfstate[:3],gfstate[3:]
+
+            ### Find nearby [velocity perpendicular to position] time
+            perpet = et0
+            deltat = - sp.vdot(gfpos,gfvel) / sp.vdot(gfvel,gfvel)
+            niter = 0
+            while niter < 10 and 1e-8 < abs(deltat):
+              niter += 1
+              perpet += deltat
+              (perpstate,lighttime
+              ,) = sp.spkezr(target_name,perpet,eval_reffrm,"NONE",center_name)
+              perppos,perpvel = perpstate[:3],perpstate[3:]
+              deltat = - sp.vdot(gfpos,gfvel) / sp.vdot(gfvel,gfvel)
+
+            ### Print results
+            lt_peri.append(dict(ET=et0
+                               ,ETCAL=sp.etcal(et0)
+                               ,FRAME=eval_reffrm
+                               ,GFPOS=list(gfpos)
+                               ,GFVEL=list(gfvel)
+                               ,ETDIFF=perpet-et0
+                               ,PERPET=perpet
+                               ,PERPOS=list(perppos)
+                               ,PERVEL=list(perpvel)
+                               ,POSDIFF=sp.vnorm(sp.vsub(gfpos,perppos))
+                               ,))
+
+        self.dt_spks[spkfn].append(dt_seg)
+
+      ### UNLOAD the SPK
+      sp.spkuef(handle)
+
+    return self
+
+  ######################################################################
+  def dumpjson(self,f=sys.stdout):
+    sj.dump(self.dt_spks,f,indent=2,sort_keys=True)
+
 
 ########################################################################
 def do_main(lt_argv):
 
+  ### Initialize objects
   tsoi,cframes,spks = TARGETS(),CFRAMES(),SPKS()
 
+  ### Parse (command-line) arguments
   for arg in lt_argv:
 
     if '--allow-center-sun' == arg:
@@ -238,129 +355,7 @@ def do_main(lt_argv):
 
 
   ######################################################################
-  base_comments = []
-
-  ### Loop over SPKs
-  for spkfn in spks.lt_spks:
-
-    ### Load the SPK and start a segment array search
-    handle = sp.spklef(spkfn)
-    sp.dafbfs(handle)
-
-    lt_found = list()
-
-    ### Loop over segments
-    while sp.daffna():
-
-      ### Get and parse segment summary; adjust ET start and stop limits
-      ets,ic = sp.dafus(sp.dafgs(),2,6)
-      ets = fix_cnfine(ets)
-
-      (target_id,center_id,spk_reffrm_id,segtype,addrinit,addr_final
-      ,)= map(int,ic)
-
-      ### Get target name and center names
-      ### - Method tsoi.of_interest will return False,False
-      ###   for segments that should be ignored
-      target_name,center_name = tsoi.of_interest(target_id,center_id)
-
-      if target_name:
-        ### Add ETs, names and frame if segment is of interest
-        lt_found.append((ets,target_name,center_name,spk_reffrm_id,segtype,))
-
-
-    ### Loop over segments of interest
-    for (ets,target_name,center_name,spk_reffrm_id,segtype) in lt_found:
-
-      segment_comments = []
-
-      ### Convert frame ID to name
-      spk_reffrm_name = sp.frmnam(spk_reffrm_id)
-
-      ### Print provenance of segment
-      print()
-      pprint.pprint(dict(ets=list(ets)
-                        ,calets=list(map(sp.etcal,ets))
-                        ,target_name=target_name
-                        ,center_name=center_name
-                        ,segment_type=segtype
-                        ,spk_reffrm_name=spk_reffrm_name
-                        ,SPK=spkfn
-                        ))
-
-      ### Initialize CNFINE argument to be passed to GFPOSC
-      cnfine = sp.cell_double(2)
-
-      sp.wninsd(ets[0],ets[1],cnfine)
-
-      ### Maintain flag of whether a local minimum of range was found
-      no_periapsis_found = True
-
-      ### Loop over segment frame, plus any frames provided via argv
-      for eval_reffrm in cframes.iterator(spk_reffrm_name):
-
-        ### Find any periapsides
-        result = sp.cell_double(1000)
-        try:
-          sp.gfposc(target_name,eval_reffrm,"NONE",center_name
-                   ,"RA/DEC", "RANGE","LOCMIN"
-                   ,0.0,0.0,sp.spd()/4.0
-                   ,2000,cnfine,result
-                   )
-        except:
-          etcnfine = sp.wnfetd(cnfine,0)
-          segment_comments.append(tb.format_exc())
-          cnfine = sp.cell_double(2)
-          sp.wninsd(ets[0]+1e-3,ets[1]-1e-3,cnfine)
-          sp.gfposc(target_name,eval_reffrm,"NONE",center_name
-                   ,"RA/DEC", "RANGE","LOCMIN"
-                   ,0.0,0.0,sp.spd()/4.0
-                   ,2000,cnfine,result
-                   )
-
-        ### Loop over periapsides
-        count = sp.wncard(result)
-        for i in range(count):
-          no_periapsis_found = False
-
-          ### Get state time of periapse
-          et0 = sp.wnfetd(result,i)[0]
-          (gfstate,lighttime
-          ,) = sp.spkezr(target_name,et0,eval_reffrm,"NONE",center_name)
-          gfpos,gfvel = perppos,perpvel = gfstate[:3],gfstate[3:]
-
-          ### Find nearby [velocity perpendicular to position] time
-          perpet = et0
-          deltat = - sp.vdot(gfpos,gfvel) / sp.vdot(gfvel,gfvel)
-          niter = 0
-          while niter < 10 and 1e-8 < abs(deltat):
-            niter += 1
-            perpet += deltat
-            (perpstate,lighttime
-            ,) = sp.spkezr(target_name,perpet,eval_reffrm,"NONE",center_name)
-            perppos,perpvel = perpstate[:3],perpstate[3:]
-            deltat = - sp.vdot(gfpos,gfvel) / sp.vdot(gfvel,gfvel)
-
-          ### Print results
-          pprint.pprint(dict(REFFRM=eval_reffrm
-                            ,ET=et0
-                            ,ETCAL=sp.etcal(et0)
-                            ,GFPOS=list(gfpos)
-                            ,GFVEL=list(gfvel)
-                            ,ETDIFF=perpet-et0
-                            ,PERPET=perpet
-                            ,PERPOS=list(perppos)
-                            ,PERVEL=list(perpvel)
-                            ,POSDIFF=sp.vnorm(sp.vsub(gfpos,perppos))
-                            ,ZZCOMMENTS=base_comments+segment_comments
-                            ,))
-
-      if no_periapsis_found:
-        ### Flag cases where no local range minima were in the segment
-        print(dict(Result='No periapsides found in this time range'))
-
-    ### UNLOAD the SPK
-    sp.spkuef(handle)
+  spks.process_spks(tsoi,cframes).dumpjson()
 
 
 ########################################################################
